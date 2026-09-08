@@ -424,9 +424,13 @@
        nothing about which of the two files it is about to get. Two buttons that
        each name their own result cannot be read the wrong way round, and it is
        the pattern the format row below already uses. -->
-  <button type="button" data-act="mode" data-mode="shapes" aria-pressed="true"
+  <!-- The pressed state here matches EXPORT.lines in the tail, which defaults
+       on. syncBars() would correct these attributes anyway, but it runs after
+       the first paint, and a row that shows the wrong button lit for a frame is
+       a row that has told the hand something untrue. -->
+  <button type="button" data-act="mode" data-mode="shapes" aria-pressed="false"
           title="הצורות המוגמרות מסתובבות — בלי הציור שיצר אותן">ייצוא צורות סופיות בלבד</button>
-  <button type="button" data-act="mode" data-mode="lines" aria-pressed="false"
+  <button type="button" data-act="mode" data-mode="lines" aria-pressed="true"
           title="הציור עצמו: הקווים נמתחים והופכים לצורות, ואז סיבוב מלא">ייצוא כולל ציור קווי הבסיס</button>
   <span class="sep"></span>
   <button type="button" data-act="clear">נקה</button>
@@ -13763,8 +13767,15 @@ let bgSettle = 0;
    brief separated them: the format is a choice that stands until it is changed,
    the length belongs to it, and exporting is its own act. `lines` is the second
    choice and the larger one — whether the file is the finished shapes turning,
-   or the drawing that made them. */
-const EXPORT = { fmt: 'mp4', lines: false };
+   or the drawing that made them.
+
+   `lines` DEFAULTS ON (8 Sep 26). The drawing is the part of this tool that
+   nobody else has, and a default that leaves it out means the file most people
+   export is the one that shows the least. Turning it off is one press and the
+   button says what it gives; not knowing the replay existed was not. If nothing
+   was recorded the export falls back to the shapes and says so, so the default
+   cannot produce an empty file. */
+const EXPORT = { fmt: 'mp4', lines: true };
 
 const BARS = [...document.querySelectorAll('.bar')];
 
