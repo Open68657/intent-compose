@@ -1435,28 +1435,71 @@ function alphaFromScan(name, cut = 0.72, soft = 0.10) {
   g.drawImage(src, 0, 0);
   const d = g.getImageData(0, 0, c.width, c.height);
   const px = d.data;
-  const H = c.height;
-  for (let i = 0; i < px.length; i += 4) {
+  const H = c.height, W = c.width;
+  /* The raw cut first, and kept, because the spine below needs to know what the
+     column it is about to protect actually contains. */
+  const raw = new Float32Array(px.length / 4);
+  for (let i = 0, k = 0; i < px.length; i += 4, k++) {
     const lum = (px[i] * 0.2126 + px[i + 1] * 0.7152 + px[i + 2] * 0.0722) / 255;
     // white paper is a hole, paint is solid, and the band between them is
     // narrow: a soft edge here would fray every gap into a haze
-    let a = 1 - Math.max(0, Math.min(1, (lum - cut) / soft));
-    /* THE SPINE IS NEVER OPENED, and without this the mark tore in half.
-       The ribbon's v runs across its width, so a row of this image is a line
-       ACROSS the stroke — and the scan has places where the brush skipped all
-       the way across, which became a hole spanning the full width. With alphaTest
-       that is not a gap in the paint, it is a cut: the stroke ends, and the next
-       piece begins with a straight machined edge where the geometry was sliced.
+    raw[k] = 1 - Math.max(0, Math.min(1, (lum - cut) / soft));
+  }
+  /* HOW MUCH INK STANDS AT THIS POINT ALONG THE MARK (9 Sep 26).
+
+     Columns, because the ribbon's v runs across its width: a row of this image
+     is a line ACROSS the stroke, so a COLUMN is one place along it. */
+  const colInk = new Float32Array(W);
+  for (let x = 0; x < W; x++) {
+    let s = 0;
+    for (let y = 0; y < H; y++) s += raw[y * W + x];
+    colInk[x] = s / H;
+  }
+  for (let i = 0, k = 0; i < px.length; i += 4, k++) {
+    let a = raw[k];
+    /* THE SPINE IS NEVER OPENED, and without this the mark tore in half. The
+       scan has places where the brush skipped all the way across, which became a
+       hole spanning the full width. With alphaTest that is not a gap in the
+       paint, it is a cut: the stroke ends, and the next piece begins with a
+       straight machined edge where the geometry was sliced.
 
        A real dry brush does not do that. It runs out at the edges of the mark and
        thins toward them while the middle, where the bristles are loaded deepest,
        stays down. So the middle third is held solid and the holes are free to
-       open toward both edges. */
-    const v = Math.floor(i / 4 / c.width) / H;
-    const spine = 1 - Math.min(1, Math.abs(v - 0.5) / 0.30);
+       open toward both edges.
+
+       SCALED BY THE COLUMN'S OWN INK, AND THIS IS THE FIX FOR "the brush still
+       has grey at the end where it should be transparent" (9 Sep 26). Held flat,
+       the spine does not distinguish between a gap the brush skipped over and the
+       place the brush LEFT THE PAPER. At the end of the mark the scan is white
+       across its whole width, and a flat spine painted that white paper back on
+       as solid: a milky grey tongue hanging off the end of every stroke, opaque
+       because it had been told to be.
+
+       There is nothing to hold together in a column with no ink in it. So the
+       protection rides the column's own coverage: strong through the body of the
+       mark, where a full-width skip really would cut it in two, and gone where
+       the brush has run out, which is exactly where transparency is the truth.
+       The mark still cannot tear; it is now allowed to END. */
+    const x = k % W, v = Math.floor(k / W) / H;
+    const spine = (1 - Math.min(1, Math.abs(v - 0.5) / 0.30)) * colInk[x];
     a = Math.max(a, spine);
-    px[i] = px[i + 1] = px[i + 2] = 255;
-    px[i + 3] = Math.round(a * 255);
+    /* WRITTEN TO RGB, AND THIS IS WHY THERE WERE NEVER ANY HOLES (9 Sep 26).
+
+       Reported as "at the joint it is grey too, and it should be a real hole you
+       can see through". It should, and it never was: three reads an alphaMap from
+       the texture's GREEN channel, and this wrote the mask into the ALPHA channel
+       while setting rgb to a flat 255. Green was therefore 1 at every texel, the
+       multiply was a no-op, and `alphaTest` had nothing to cut. Every gap the
+       scan carried came out as opaque white paper — which is exactly the grey.
+
+       It is a quiet failure of the worst kind, because everything around it was
+       right: the cut, the spine, the retry that waits for the pixels. The map was
+       built correctly and handed over on a channel nobody reads. Alpha is kept as
+       well, so the texture is still honest if anything ever samples it that way. */
+    const m = Math.round(a * 255);
+    px[i] = px[i + 1] = px[i + 2] = m;
+    px[i + 3] = m;
   }
   g.putImageData(d, 0, 0);
   const t = new THREE.CanvasTexture(c);
@@ -1808,6 +1851,30 @@ const MATERIALS = [
        that against the inradius. Judged by eye against the torn-slab
        reference; the number is a starting point for the designer's eye, not a law. */
     layer2: 0, depthScale: 0.32, grainAlong: true, grainLocal: true, colony: 0,
+    /* `closedGrain: 'one'` AND THIS WAS THE WHOLE OF IT (9 Sep 26). The brief:
+       "the closed shape reads very spiky and dense, next to the linear one. The
+       fibres should broadly run left to right, or top to bottom, or at some
+       angle, but not with this feeling that everything comes out of the centre."
+
+       "Out of the centre" was literal, and it was not the projection. It was
+       `grainLocal`, which asks outlineGrainAttr for a grain direction PER VERTEX
+       taken from the local direction of the drawn outline. On an open stroke that
+       is exactly right and it is why the drawn LINE always looked like wood: the
+       outline runs one way along its length, so the fibres do too. On a closed
+       shape the outline turns through a full circle, so the grain turns through a
+       full circle with it, and the fibres wrap the perimeter and radiate. The
+       material was following the hand faithfully into a pattern nobody wanted.
+
+       So the per-vertex bend is kept for strokes, where it earns its place, and
+       the closed body takes the single angle `grainAlong` already computes: the
+       principal axis of the outline that was drawn. One direction, decided by the
+       shape, falling back to noise on a shape with no long axis — the random she
+       allowed.
+
+       `closedTile: 0.8` is her second note, texture down to 80%, and it is a
+       separate number from `tile` on purpose: it rides only the two places the
+       closed body scales through, so the drawn stroke keeps the size it has. */
+    closedGrain: 'one', closedTile: 0.8,
     // and it ends the way a broken slab ends: torn across the plates at the ends,
     // following a fissure down the sides
     /* jag up from 0.024/run 14 on 14 Aug: the reference's ends are properly
@@ -6638,7 +6705,54 @@ function scanPixels(file) {
    a kaleidoscope". Paint pulled across a surface has ONE direction, the one the
    drag had, so the whole body takes the sheet at a single angle: the stroke's
    own (M._rot), the same angle the carve uses, same matrix, same sign. */
-function wrapUVs(g, scale, faceTurn = 1, seed = 0, single = null) {
+/* THE SHEET GOES ROUND THE BODY, NOT ACROSS ITS FRONT (9 Sep 26).
+
+   The brief: "there is still no uniform direction to the fibres, it feels spiky
+   next to the linear form. They should broadly run left to right, or top to
+   bottom, or at some angle, but not with this feeling that everything comes out
+   of the centre."
+
+   The fans at both edges were the projection's signature and not a grain at all.
+   `wrapUVs` reads x and y and ignores z, so on a body that has been inflated the
+   shoulders are the failure: there x and y barely move while z runs away, a whole
+   run of vertices collapses onto nearly one uv, and the scan is stretched into
+   rays pointing out of the middle. A flat stamp is fine on a flat body, and every
+   material that wrapped before this one was flat.
+
+   Bark is not flat, and bark has an answer nothing else has: it is a sheet that
+   grew WRAPPED AROUND a trunk. So the sheet is rolled about the grain axis. The
+   distance along that axis is v, which is the direction the scan's fissures run,
+   and the angle around it is u. The fibres then run the same way on the front, on
+   the back and over both shoulders, because there is no front any more.
+
+   UNFOLDED RATHER THAN ROLLED, and the first attempt is worth keeping in words
+   because it looked plausible and was wrong. Rolling with atan2 assumes a
+   CYLINDER, and these bodies are inflated slabs: nearly flat through z. Almost
+   the whole angular range then falls in a thin band at the rim while the two
+   broad faces share what is left, so the scan came back as stacked contour
+   rings — a direction, finally, but a topographic map rather than wood.
+
+   So the sheet is unfolded instead, the way a label is peeled off a tin: u runs
+   straight across the front face, turns the rim, and keeps running back along the
+   far side. It is continuous over one rim, breaks over the other, and that one
+   seam is a repeat boundary rather than a swirl. The faces, which are what you
+   actually look at, get an even sheet.
+
+   The half-width is measured off the bounding box rather than every vertex,
+   because reliefDisplace has to arrive at the SAME number without walking the
+   mesh twice — and a carve that disagrees with its own sheet is the pull lesson,
+   which this file has now paid for three times. */
+function grainWrap(bb, cs, sn, scale) {
+  const cx = (bb.min.x + bb.max.x) / 2, cy = (bb.min.y + bb.max.y) / 2;
+  const cz = (bb.min.z + bb.max.z) / 2;
+  let half = 1e-6;
+  for (const X of [bb.min.x, bb.max.x]) for (const Y of [bb.min.y, bb.max.y]) {
+    half = Math.max(half, Math.abs(cs * (X - cx) - sn * (Y - cy)));
+  }
+  return { cx, cy, cz, half };
+}
+
+function wrapUVs(g, scale, faceTurn = 1, seed = 0, single = null, round = false) {
   const geo = g.index ? g.toNonIndexed() : g;
   const pos = geo.attributes.position;
   /* Measured from the body's own corner, not from the world origin, and this is
@@ -6658,6 +6772,8 @@ function wrapUVs(g, scale, faceTurn = 1, seed = 0, single = null) {
   geo.computeBoundingBox();
   const bb = geo.boundingBox;
   const cx = (bb.min.x + bb.max.x) / 2, cy = (bb.min.y + bb.max.y) / 2;
+  // rolled mode needs the axis before the loop, and it only exists with one angle
+  const W = round ? grainWrap(bb, Math.cos(single || 0), Math.sin(single || 0), scale) : null;
   const uv = new Float32Array(pos.count * 2);
   const a = new THREE.Vector3(), b = new THREE.Vector3(), c = new THREE.Vector3();
   const ab = new THREE.Vector3(), ac = new THREE.Vector3(), fn = new THREE.Vector3();
@@ -6684,6 +6800,23 @@ function wrapUVs(g, scale, faceTurn = 1, seed = 0, single = null) {
       : faceTurn === 0 ? 0
       : Math.round(Math.atan2(fn.y, fn.x) / step) * step * faceTurn + (seed % 7) * 0.41;
     const cs = Math.cos(ang), sn = Math.sin(ang);
+    if (round) {
+      // rolled about the grain axis: v runs along it, u goes round it
+      for (let k = 0; k < 3; k++) {
+        const dx = pos.getX(t + k) - W.cx, dy = pos.getY(t + k) - W.cy, dz = pos.getZ(t + k) - W.cz;
+        /* Same pairing the planar branch uses, so "along" means the same
+           direction in both: v is the component along the body's grain axis,
+           which is where the scan keeps its fissures. Swapped, the fibres come
+           out at right angles to the shape and look deliberate about it. */
+        const along = sn * dx + cs * dy;
+        const across = cs * dx - sn * dy;
+        // over the rim and back along the far side, so the two faces are one sheet
+        const u = dz >= 0 ? across : (2 * W.half - across);
+        uv[(t + k) * 2] = u * scale + 0.5;
+        uv[(t + k) * 2 + 1] = along * scale + 0.5;
+      }
+      continue;
+    }
     for (let k = 0; k < 3; k++) {
       const px = pos.getX(t + k) - cx, py = pos.getY(t + k) - cy;
       /* The half puts the body's centre at the middle of the TILE, which is
@@ -6798,14 +6931,22 @@ function reliefDisplace(g, file, scale, depth, sharp = 4, rot = 0, o = {}) {
      fissures a v-flip is invisible, which is how it hid; on paint blotches it
      puts every carved ridge under the wrong blotch. */
   const planar = !!o.planar;
+  // rolled about the grain axis instead of stamped on the front (bark; see the
+  // note over grainWrap). It is a kind of planar as far as everything below is
+  // concerned: same single angle, same centre, same identity lum.
+  const rolled = !!o.round && planar;
   const biasDark = (o.bias && o.bias.dark) ?? 1.7;
   const biasLight = (o.bias && o.bias.light) ?? 1;
   const pcs = Math.cos(planar ? rot : 0), psn = Math.sin(planar ? rot : 0);
-  let pcx = 0, pcy = 0;
+  let pcx = 0, pcy = 0, pcz = 0, phalf = 1;
   if (planar) {
     g.computeBoundingBox();
     pcx = (g.boundingBox.min.x + g.boundingBox.max.x) / 2;
     pcy = (g.boundingBox.min.y + g.boundingBox.max.y) / 2;
+    if (rolled) {
+      const W = grainWrap(g.boundingBox, pcs, psn, scale);
+      pcz = W.cz; phalf = W.half;
+    }
     rot = 0;      // the turn happens out here now; lum's own must be identity
   }
   /* The same turn the shader applies, and it has to be here as well or the two
@@ -6892,7 +7033,16 @@ function reliefDisplace(g, file, scale, depth, sharp = 4, rot = 0, o = {}) {
        the opposite: paint stands PROUD of its sheet, so pull boosts the light
        side and eases the dark — see its profile.) */
     let raw;
-    if (planar) {
+    if (rolled) {
+      // the same roll wrapUVs writes, vertex for vertex: u round the grain axis,
+      // v along it. Duplicated rather than shared because the sheet is laid on
+      // after this carve runs, so there is no uv attribute here to read yet.
+      const dx = x - pcx, dy = y - pcy, dz = z - pcz;
+      const across = pcs * dx - psn * dy;
+      const uw = (dz >= 0 ? across : (2 * phalf - across)) * scale + 0.5;
+      const vw = (psn * dx + pcs * dy) * scale + 0.5;
+      raw = lum(uw, 1 - vw) - (px.mean ?? SCAN_MEAN);
+    } else if (planar) {
       const dx = x - pcx, dy = y - pcy;
       const uw = (pcs * dx - psn * dy) * scale + 0.5;
       const vw = (psn * dx + pcs * dy) * scale + 0.5;
@@ -7816,9 +7966,17 @@ function bodyFromOutline(p, cx, cy, span, seed, M = {}, drawnRoundness = 1, keep
      a sample spacing that is fine for one consumer is aliasing for another. */
   // the grain field first, so the carve below can turn with it — the fibres of
   // a bent closed shape run with the long edges, not with one straight axis
-  if (M.grainLocal) outlineGrainAttr(g, poly, M._rot || 0);
+  /* `closedGrain: 'one'` keeps the per-vertex bend for strokes and refuses it
+     here. A closed outline turns through a full circle, so a grain that follows
+     it turns through a full circle too and the fibres radiate — see bark's
+     profile for the whole of that. Without the attribute the shader's vGrainRot
+     and the carve's rotAttr are both zero, which is the body's single angle. */
+  if (M.grainLocal && M.closedGrain !== 'one') outlineGrainAttr(g, poly, M._rot || 0);
   if (M.relief && M.file && (!M.round || M.reliefRound)) {
-    const reliefScale = 1 / (M.tile * (M.reliefTile ?? 1));
+    // closedTile rides here and in the shader's triplanar call, and nowhere
+    // else: those two are the closed body's whole scale, so a drawn stroke is
+    // untouched by it. Her note was "smaller texture, on the closed shapes only".
+    const reliefScale = 1 / (M.tile * (M.closedTile ?? 1) * (M.reliefTile ?? 1));
     /* 24 rather than 16 on a block. The wall now has rings of its own, but the ones
        nearest the chamfer still have normals halfway between facing forward and
        facing sideways — and while the front projection keeps any weight at all
@@ -7828,7 +7986,7 @@ function bodyFromOutline(p, cx, cy, span, seed, M = {}, drawnRoundness = 1, keep
     // painted through — three object-space planes would carve a different
     // rock than the one being printed (see reliefDisplace's planar note)
     reliefDisplace(g, M.file, reliefScale, span * VIEW * 0.075 * M.relief, M.facets ? 24 : 4, M._rot || 0,
-                   { planar: !!M.wrap, bias: M.reliefBias,
+                   { planar: !!M.wrap, round: !!(M.wrap && M.wrap.round), bias: M.reliefBias,
                      rotAttr: g.attributes.aGrainRot });
   }
   /* And once the shape is final, the edges. Only where the drawing asked for a
@@ -8240,10 +8398,73 @@ function brushRibbon(path3, radius, widths, seed, closed, o = {}) {
      itself instead of cutting a stroke off mid-bristle. */
   const uRepeat = Math.max(1, Math.round(curveLen / Math.max(1e-3, radius * 9)));
 
+  /* THE END, AND WHY IT WAS A RULED LINE (8 Sep 26).
+
+     The sweep ran to t=1 and stopped, so the last ring was the open rim of the
+     lens: a smooth curve cut square across the mark. `lift` holding the ends at
+     a fifth of the width instead of at a point is right — a brush lifted off the
+     paper leaves an END — but the end it left was drawn with a ruler. lumpyTube
+     was given torn ends in August because a slab of bark does not end in a
+     machined dome. The ribbon never got the same treatment, and a brush mark has
+     the stronger claim to one.
+
+     What a real end looks like is in the scan itself, at its left and right
+     edges: the bristles do not stop together. Each one ends at its own point, so
+     the end is a COMB of fingers running along the stroke with paper between
+     them. So every vertex is pulled back along the tangent by its own amount,
+     and that amount is a function of where it sits ACROSS the mark — cos(b),
+     which is the same value on the front face and the back — so a finger goes
+     THROUGH the paint's thickness rather than being drawn on one side of it.
+
+     field01 and not fbm, and the bead cloud already paid for this lesson: the
+     coordinate here spans a single mark's width, and fbm over a span that short
+     comes back nearly one value everywhere with no say in anything. field01's
+     range is arithmetic rather than statistical.
+
+     The comb is measured in the mark's own width and not in the line's length,
+     because bristles are as long as they are however far the hand travelled.
+     `maxPull` is held under the ramp it rides on: the displacement's gradient
+     along the stroke is maxPull/bristle, so keeping that under 1 keeps the rings
+     in order and no face turns itself inside out. */
+  const bristle = closed ? 0 : Math.min(0.45, (radius * 1.2) / Math.max(1e-3, curveLen));
+  /* THE COMB CANNOT BE FINER THAN THE RING IT IS CUT INTO (9 Sep 26).
+
+     Reported as "there are still slightly dark patches at the ends, floating",
+     and isolated by building the same stroke with maxPull at 0: they went. Mine.
+
+     The comb samples field01 across the mark, and the first version asked for it
+     at k=22 to get ten or fifteen fingers. There are RING=14 vertices around the
+     section, about seven distinct positions across the mark once the loop folds
+     back on itself. Asking for fifteen fingers from seven samples is aliasing:
+     neighbouring vertices drew pulls with no relation to each other, the end ring
+     came out a zigzag, and the triangles spanning it stretched into slivers lying
+     nearly edge-on. Those are the floating patches — untextured-looking because a
+     sliver that thin carries almost no map across it.
+
+     So the comb is cut at a frequency the ring can actually resolve. Three or
+     four fingers across a mark is also closer to what a flat brush leaves than
+     fifteen: bristles clump in the paint, they do not comb it evenly.
+
+     And maxPull is held against the ramp it rides on IN WORLD UNITS, not against
+     the radius alone. The gradient along the stroke is maxPull/rampLen, and over
+     1 a ring lands behind the one before it and the surface folds through itself.
+     The radius-only form was fine for a long stroke and quietly wrong for a short
+     fat one, where the ramp is a fraction of the line rather than of the width. */
+  const rampLen = bristle * curveLen;
+  const maxPull = Math.min(radius * 0.85, rampLen * 0.6);
+
   for (let i = 0; i <= STEPS; i++) {
     const t = i / STEPS;
     curve.getPointAt(closed ? t % 1 : t, P);
     const N = frames.normals[i], B = frames.binormals[i];
+    const T = frames.tangents[i];
+    /* 0 through the body and 1 at either tip. min(t, 1-t) keeps the two ramps
+       apart on its own: bristle can never reach 0.5, so they cannot overlap and
+       fight over the middle of a short stroke. */
+    const endAmt = bristle > 0 ? Math.max(0, 1 - Math.min(t, 1 - t) / bristle) : 0;
+    // into the body from whichever end this is, and a different comb at each
+    const pullDir = t < 0.5 ? 1 : -1;
+    const endSeed = t < 0.5 ? seed : seed + 17.3;
     let press = 1;
     if (widths && widths.length > 1) {
       const f = t * (widths.length - 1), i0 = Math.floor(f), k = f - i0;
@@ -8279,9 +8500,16 @@ function brushRibbon(path3, radius, widths, seed, closed, o = {}) {
       // the lens: wide across the mark, thin through it, turned by `ang`
       const ex = Math.cos(b) * w, ey = Math.sin(b) * w * thick;
       const rx = ex * ca - ey * sa, ry = ex * sa + ey * ca;
-      verts.push(P.x + N.x * (rx + drift) + B.x * ry,
-                 P.y + N.y * (rx + drift) + B.y * ry,
-                 P.z + N.z * (rx + drift) + B.z * ry);
+      /* The finger this bristle leaves. Floored at 0.18 rather than at 0: where
+         the field happens to sit near zero across a run of j, a stretch of the
+         old ruled rim would survive between two fingers, which is the one thing
+         this is here to remove. */
+      const pull = endAmt > 0
+        ? maxPull * endAmt * (0.18 + 0.82 * field01(Math.cos(b), 0.4, 5, endSeed)) * pullDir
+        : 0;
+      verts.push(P.x + N.x * (rx + drift) + B.x * ry + T.x * pull,
+                 P.y + N.y * (rx + drift) + B.y * ry + T.y * pull,
+                 P.z + N.z * (rx + drift) + B.z * ry + T.z * pull);
       /* v is folded: the section runs all the way round, so letting v run 0..1
          round it would mirror the map on the back face and put a seam down both
          edges. Folded, the back wears the same band as the front, which is what
@@ -9208,6 +9436,7 @@ window.devShapeRule = (footprint = 0.4, open = false, n = 6000) => {
    the largest legal stroke actually finishes at. If measured growth exceeds
    assumed, the cap is being broken and QUILLS_GROWTH is wrong. */
 window.devQuillGrowth = (drawnPx = 200) => {
+  // FW, not FW, for the reason recorded at the footprint rule in birth()
   const half = drawnPx / 2, cx = FW / 2, cy = FH / 2, p = [];
   for (let i = 0; i <= 48; i++) {
     const t = i / 48 * Math.PI * 2;
@@ -9435,7 +9664,15 @@ function birth(screenPts) {
      whole length, so the box is very close to what they end up covering, and
      erring toward "too big" is the right direction for a rule whose whole job
      is to keep this material small. `w` and `h` are in the frame's own pixels,
-     so the fraction is against FW*FH and not against the export. */
+     so the fraction is against the drawing surface and not against the export.
+
+     WRITTEN AS FW, AND IT HAS TO BE (8 Sep 26). build_compose.py turns
+     every FW into FW on the way to the composition tool, because there
+     the drawing surface is the format and not the window. Naming FW here instead
+     read correctly in the built tool and threw `FW is not defined` on every
+     single draw in this file — the prototype could not put down a body at all.
+     The rule the build implies: this file says FW and lets the build say
+     FW. Nothing here may name a variable that only exists downstream. */
   const shape = { footprint: (a.w * a.h) / Math.max(1, FW * FH),
                   open: !a.closed, round: a.round };
   const M0 = MATERIALS[forcedMat >= 0 ? forcedMat : nextMaterial(shape)];
@@ -9590,7 +9827,7 @@ function birth(screenPts) {
     // strokeTile: a material may size its pattern differently against a drawn
     // line than against a closed body — crystal's leaves, judged right on a
     // body, dwarf a stroke's width (see the profile's own note)
-    triplanar(mat, 1 / (M.tile * (a.closed ? 1 : (M.strokeTile ?? 1))), {
+    triplanar(mat, 1 / (M.tile * (a.closed ? (M.closedTile ?? 1) : (M.strokeTile ?? 1))), {
       bump: M.bump, roughVar: M.roughVar, sharp: M.facets ? 16 : 4,
       layer2: M.layer2, rot: M._rot, sparkle: M.sparkle, ember: M.ember
     });
@@ -9611,6 +9848,27 @@ function birth(screenPts) {
        ribbon is not in that position. */
     mat.bumpMap = map;
     mat.bumpScale = (M.ribbon && M.ribbon.bump) ?? 0.7;
+    /* MIRRORED ALONG THE MARK, AND THIS IS THE FIX FOR "there are also ugly
+       seams in the middle of the line sometimes" (9 Sep 26).
+
+       uRepeat is held to a whole number so the tiling cannot cut a stroke off
+       mid-bristle, and that was read as making the repeat join itself. It does
+       not. A whole number only guarantees where the boundary FALLS; what meets
+       across it is the scan's right edge against the scan's left edge, and this
+       is a photograph of a real mark whose two ends have nothing to do with one
+       another. So every boundary was a hard vertical cut, pale on both sides
+       because both ends of a brush mark are where the paint ran out — which is
+       also why it only showed on long strokes, the only ones that repeat at all.
+
+       Mirrored, the sheet turns back on itself at the boundary and the two sides
+       of it are the same pixels: continuous by construction, no arithmetic to get
+       right. The bristles run ALONG u, so the reflection reverses streaks that
+       are near enough parallel for it not to read as a mirror.
+
+       wrapS only. v is folded across the ribbon's width by brushRibbon and never
+       leaves 0..1, so wrapT has nothing to do. */
+    map.wrapS = THREE.MirroredRepeatWrapping;
+    map.needsUpdate = true;
     if (M.ribbon && M.ribbon.holes) {
       /* Retried rather than read once, and the first version silently did
          nothing because of it. A scan is fetched asynchronously and the first
@@ -9623,6 +9881,10 @@ function birth(screenPts) {
       const attach = () => {
         const am = alphaFromScan(M.file, M.ribbon.holeCut ?? 0.72);
         if (am) {
+          // the holes have to turn back at the same boundary the colour does, or
+          // the seam survives as a line of gaps where the sheet no longer agrees
+          am.wrapS = THREE.MirroredRepeatWrapping;
+          am.needsUpdate = true;
           mat.alphaMap = am;
           // a cut rather than a blend: transparency would need sorting against
           // every other body in the pile, and a hole in a stroke is not a
@@ -9867,14 +10129,21 @@ function birth(screenPts) {
      same map drives a shallow bump, which is where the fibre and the fold marks
      come from: the type must stay flat (ink has no thickness) but the PAPER is
      not flat, and without that the stone reads as printed rather than covered. */
-  if (M.wrap && geo && map) {
+  /* `!slabLine`, and bark is why (9 Sep 26). A slab stroke's sweep has already
+     written real uvs that run ALONG the mark, and that sheet is better than any
+     projection can be: it follows the stroke round its own bends and over its
+     turned side faces. Laying a wrap over it would throw that away and print one
+     flat stamp across a curved line. The wrap is for the body that has no such
+     sheet — the closed outline — and materials that wrapped before this were
+     never slabs, so the case had not come up. */
+  if (M.wrap && geo && map && !slabLine) {
     /* Rolled round the body rather than projected onto its front, and turned by
        the body's own angle so two of them side by side are not printed off the
        same square inch of the page. `wrapUVs` returns a new geometry — it goes
        non-indexed so each face can carry its own direction — so it is taken
        back rather than being assumed to have edited in place. */
     geo = wrapUVs(geo, 1 / M.tile, M.wrap.faceTurn ?? 1, seed,
-                  M.wrap.steps === 0 ? (M._rot || 0) : null);
+                  M.wrap.steps === 0 ? (M._rot || 0) : null, !!M.wrap.round);
     mat.bumpMap = map;
     mat.bumpScale = M.wrap.bump ?? 0.25;
   }
